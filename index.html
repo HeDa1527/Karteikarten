@@ -273,7 +273,7 @@ a.btn{text-decoration:none}
 <script src="fsrs.js"></script>
 <script>
 'use strict';
-const APP_VERSION = '8';
+const APP_VERSION = '9';
 /* ================= Hilfsfunktionen ================= */
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -678,7 +678,7 @@ function renderReview() {
   }
 }
 function showAnswer() { if (!S.cur.c || S.shown) return; S.shown = true; renderReview(); }
-$('#rv-card').addEventListener('click', (e) => { if (!S.shown && S.cur && S.cur.c && !e.target.closest('button')) showAnswer(); });
+$('#rv-scroll').addEventListener('click', (e) => { if (!S.shown && S.cur && S.cur.c && !e.target.closest('button,a')) showAnswer(); });
 $('#rv-bottom').addEventListener('click', (e) => { const b = e.target.closest('[data-g]'); if (b) answer(+b.dataset.g); });
 
 function answer(g) {

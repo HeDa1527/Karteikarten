@@ -1,5 +1,5 @@
 // Offline-Cache für die App-Hülle. Version erhöhen, wenn sich Dateien ändern.
-const CACHE = "karteikasten-v8";
+const CACHE = "karteikasten-v9";
 const FILES = ["./", "index.html", "fsrs.js", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png"];
 
 self.addEventListener("install", (e) => {
