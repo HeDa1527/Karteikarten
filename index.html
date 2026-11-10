@@ -273,7 +273,7 @@ a.btn{text-decoration:none}
 <script src="fsrs.js"></script>
 <script>
 'use strict';
-const APP_VERSION = '7';
+const APP_VERSION = '8';
 /* ================= Hilfsfunktionen ================= */
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1178,7 +1178,7 @@ async function renderSettings() {
     <div class="row"><input id="st-ret" type="number" inputmode="numeric" min="70" max="97" value="${ret}"><button class="btn" id="st-ret-save" style="margin:0">Übernehmen</button></div>
     <p class="note">Höher = häufigere Wiederholungen. Lernschritte wie in Anki: 1 Min. und 10 Min., Wiederlernen 10 Min., Tageswechsel um 4 Uhr.</p>
     <h3>Fragen importieren</h3>
-    <p class="note">CSV/TXT (Frage; Antwort; Erklärung – Trennung mit Tab, Semikolon oder Komma) oder JSON aus der MC-Analyse. Bereits vorhandene Fragen werden übersprungen.</p>
+    <p class="note">CSV-Export der MC-Analyse direkt, oder eigene CSV (Frage; Antwort; Erklärung) bzw. JSON. Fragen, die schon im Deck sind (gleiche Fragennummer), werden übersprungen.</p>
     <label class="lb">In Deck</label>
     <select id="st-impdeck">${decks().map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join('')}<option value="__new">+ Neues Deck …</option></select>
     <button class="btn" id="st-qimp">Datei auswählen und importieren</button>
@@ -1258,22 +1258,44 @@ async function importQuestions(file, deckId) {
       const name = prompt('Name des neuen Decks:', file.name.replace(/\.[^.]+$/, '')); if (!name) return;
       deckId = uid(); save({ id: deckId, kind: 'deck', name: name.trim(), newPerDay: 20, revPerDay: 200, c: Date.now() });
     }
-    const text = await file.text(); let items = [];
+    // Excel speichert CSV oft als Windows-1252 → dann neu dekodieren
+    const buf = await file.arrayBuffer();
+    let text = new TextDecoder('utf-8').decode(buf);
+    if (text.includes('\uFFFD')) text = new TextDecoder('windows-1252').decode(buf);
+    let items = [];
     if (/\.json$/i.test(file.name) || /^\s*[\[{]/.test(text)) {
       const j = JSON.parse(text); const arr = Array.isArray(j) ? j : (j.fragen || j.questions || j.items || []);
-      items = arr.map(mcToFields);
+      items = arr.map((it) => ({ f: mcToFields(it), src: it.fragennummer || it.Fragennummer || null }));
     } else {
       const rows = parseCSV(text);
-      if (rows.length && /^(frage|question|vorderseite|front)$/i.test(rows[0][0].trim())) rows.shift();
-      items = rows.map((r) => { const f = [txt2html(r[0]), txt2html(r[1] || '')]; if (r[2] && r[2].trim()) f[1] += '<br><br>' + txt2html(r[2]); return f; });
+      const head = (rows[0] || []).map((h) => h.trim().toLowerCase());
+      const col = (name) => head.indexOf(name);
+      if (col('frage') >= 0 && col('antwort a') >= 0) {
+        // Export der MC-Analyse
+        rows.shift();
+        const L = 'ABCDE', ci = { nr: col('fragennummer'), q: col('frage'), r: col('richtige antwort'), b: col('begründung'), g: col('grafik'), ut: col('unterthema') };
+        items = rows.map((r) => {
+          const get = (i) => (i >= 0 ? r[i] || '' : '');
+          const it = { frage: get(ci.q), optionen: [...L].map((x) => get(col('antwort ' + x.toLowerCase()))), richtig: get(ci.r), erklaerung: get(ci.b) };
+          const f = mcToFields(it);
+          const meta = [get(ci.nr), get(ci.ut)].filter((x) => x.trim()).map(esc).join(' · ');
+          if (meta) f[0] = `<span style="font-size:13px;color:#888">${meta}</span><br>` + f[0];
+          if (/^ja$/i.test(get(ci.g).trim())) f[0] += '<br><br><i>(Zu dieser Frage gehört eine Grafik – siehe Originalfrage.)</i>';
+          return { f, src: get(ci.nr).trim() || null };
+        });
+      } else {
+        if (rows.length && /^(frage|question|vorderseite|front)$/i.test((rows[0][0] || '').trim())) rows.shift();
+        items = rows.map((r) => { const f = [txt2html(r[0]), txt2html(r[1] || '')]; if (r[2] && r[2].trim()) f[1] += '<br><br>' + txt2html(r[2]); return { f, src: null }; });
+      }
     }
-    const existing = new Set(all('note').filter((n) => n.deck === deckId).map((n) => n.f[0]));
+    const inDeck = all('note').filter((n) => n.deck === deckId);
+    const existing = new Set(inDeck.map((n) => n.f[0])), srcs = new Set(inDeck.map((n) => n.src).filter(Boolean));
     let n = 0, skip = 0; const t0 = Date.now();
-    for (const f of items) {
+    for (const { f, src } of items) {
       if (!stripHtml(f[0])) continue;
-      if (existing.has(f[0])) { skip++; continue; }
-      existing.add(f[0]);
-      const note = { id: uid(), kind: 'note', deck: deckId, type: 'basic', f, c: t0 + n };
+      if (existing.has(f[0]) || (src && srcs.has(src))) { skip++; continue; }
+      existing.add(f[0]); if (src) srcs.add(src);
+      const note = { id: uid(), kind: 'note', deck: deckId, type: 'basic', f, c: t0 + n, src };
       save(note); save({ id: uid(), kind: 'card', note: note.id, ord: 0, c: note.c, fs: null }); n++;
     }
     toast(`${n} Fragen importiert` + (skip ? `, ${skip} schon vorhanden` : ''), 3500);
