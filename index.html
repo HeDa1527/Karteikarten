@@ -39,6 +39,11 @@ input,select,textarea{font:inherit;color:var(--fg);background:var(--bg);border:1
 .bar{display:flex;align-items:center;gap:8px;background:var(--bar);border-bottom:1px solid var(--line);
   padding:calc(8px + var(--safe-t)) 12px 8px;min-height:48px}
 .bar h1{flex:1;margin:0;font-size:17px;font-weight:600;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar:not(.bottom){padding-left:max(12px, env(safe-area-inset-left));padding-right:max(12px, env(safe-area-inset-right))}
+/* iPad: Platz für die Fenster-Knöpfe (Schließen/Vergrößern) oben links */
+@media (min-width: 600px){
+  .bar:not(.bottom){padding-left:max(88px, env(safe-area-inset-left))}
+}
 .bar.bottom{border-top:1px solid var(--line);border-bottom:0;padding:8px 12px calc(8px + var(--safe-b));justify-content:space-around}
 .tb{color:var(--accent);padding:6px 8px;border-radius:8px;white-space:nowrap;min-width:44px;min-height:36px}
 .tb.strong{font-weight:600}
@@ -233,6 +238,7 @@ a.btn{text-decoration:none}
 <script src="fsrs.js"></script>
 <script>
 'use strict';
+const APP_VERSION = '5';
 /* ================= Hilfsfunktionen ================= */
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -889,10 +895,33 @@ async function dbx(kind, ep, arg, body, retry = true) {
   if (r.status === 401 && retry) { S.at = null; return dbx(kind, ep, arg, body, false); }
   return r;
 }
-async function dbxErr(r) {
-  let t = ''; try { t = (await r.json()).error_summary || ''; } catch {}
-  if (/missing_scope/.test(t)) return 'Dropbox-Berechtigungen fehlen (siehe Anleitung, dann neu verbinden)';
-  return t || 'HTTP ' + r.status;
+async function readErr(r) {
+  let raw = ''; try { raw = await r.text(); } catch {}
+  let sum = ''; try { sum = JSON.parse(raw).error_summary || ''; } catch {}
+  return { status: r.status, raw: raw.slice(0, 500), sum };
+}
+class DbxError extends Error {}
+async function fail(step, r) {
+  const e = await readErr(r);
+  const detail = `${step} · HTTP ${e.status} · ${e.raw || '(leer)'}`;
+  await setMeta('lastErr', new Date().toLocaleString('de-DE') + ' · ' + detail);
+  const msg = /missing_scope/.test(e.raw) ? 'Dropbox-Berechtigungen fehlen (siehe Anleitung, dann neu verbinden)' : `${step}: ${e.sum || 'HTTP ' + e.status}`;
+  throw new DbxError(msg);
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Hochladen mit Wiederholung bei vorübergehenden Fehlern („other“, 429, 5xx)
+async function upload(arg, bytes) {
+  let r;
+  for (let i = 0; i < 3; i++) {
+    r = await dbx('content', 'files/upload', arg, bytes);
+    if (r.ok) return r;
+    if (r.status === 409) {
+      const t = await r.clone().text();
+      if (!/"other"|other\//.test(t)) return r; // echter Konflikt o. Ä. → Aufrufer entscheidet
+    } else if (!(r.status === 429 || r.status >= 500)) return r;
+    await sleep(800 * (i + 1));
+  }
+  return r;
 }
 const sniff = (u8) => (u8[0] === 0x89 && u8[1] === 0x50 ? 'image/png' : u8[0] === 0xff && u8[1] === 0xd8 ? 'image/jpeg' : u8[0] === 0x47 ? 'image/gif' : 'image/webp');
 async function dbxImage(id) {
@@ -911,8 +940,12 @@ async function sync(manual) {
     // 1) neue Bilder hochladen
     for (const im of await db.all('img')) {
       if (im.synced) continue;
-      const r = await dbx('content', 'files/upload', { path: '/img/' + im.id, mode: 'add', autorename: false, mute: true }, im.blob);
-      if (!r.ok && r.status !== 409) throw new Error(await dbxErr(r));
+      const bytes = new Uint8Array(await im.blob.arrayBuffer());
+      const r = await upload({ path: '/img/' + im.id, mode: 'add', autorename: false, mute: true }, bytes);
+      if (!r.ok) {
+        const t = await r.clone().text();
+        if (!(r.status === 409 && /conflict/.test(t))) await fail('Bild hochladen', r); // conflict = schon vorhanden
+      }
       im.synced = true; await db.put('img', im);
       S.pendingImg = Math.max(0, S.pendingImg - 1);
     }
@@ -923,10 +956,10 @@ async function sync(manual) {
       let rev = null;
       const m = await dbx('api', 'files/get_metadata', { path: '/data.json' });
       if (m.ok) rev = (await m.json()).rev;
-      else if (m.status !== 409) throw new Error(await dbxErr(m));
+      else if (!(m.status === 409 && /not_found/.test(await m.clone().text()))) await fail('Daten prüfen', m);
       if (rev && rev !== (await getMeta('rev'))) {
         const d = await dbx('content', 'files/download', { path: '/data.json' });
-        if (!d.ok) throw new Error(await dbxErr(d));
+        if (!d.ok) await fail('Daten laden', d);
         try { rev = JSON.parse(d.headers.get('Dropbox-API-Result')).rev || rev; } catch {}
         const doc = await d.json();
         const upd = [];
@@ -942,24 +975,25 @@ async function sync(manual) {
       if (!dirty.length) break;
       const snap = new Map(dirty.map((r) => [r.id, r.u]));
       const doc = { app: 'karteikasten', v: 1, recs: [...S.recs.values()].map(({ d, ...r }) => r) };
-      const up = await dbx('content', 'files/upload',
+      const up = await upload(
         { path: '/data.json', mode: rev ? { '.tag': 'update', update: rev } : 'add', autorename: false, mute: true },
-        new Blob([JSON.stringify(doc)]));
-      if (up.status === 409 && tries < 4) continue; // anderes Gerät war schneller → neu zusammenführen
-      if (!up.ok) throw new Error(await dbxErr(up));
+        new TextEncoder().encode(JSON.stringify(doc)));
+      if (up.status === 409 && tries < 4 && /conflict/.test(await up.clone().text())) continue; // anderes Gerät war schneller
+      if (!up.ok) await fail('Daten hochladen', up);
       await setMeta('rev', (await up.json()).rev);
       const done = [];
       for (const [id, u] of snap) { const cur = S.recs.get(id); if (cur && cur.u === u) { delete cur.d; done.push(cur); } }
       await db.putMany('rec', done);
       break;
     }
-    await setMeta('lastSync', Date.now());
+    await setMeta('lastSync', Date.now()); await setMeta('lastErr', null);
     if (S.view === 'decks') renderDecks();
     if (S.view === 'settings') renderSettings();
     if (manual) toast(got ? `Synchronisiert (${got} Änderungen geladen)` : 'Synchronisiert');
     prefetchImages();
   } catch (e) {
-    if (manual) toast('Sync fehlgeschlagen: ' + e.message, 4500);
+    if (!(e instanceof DbxError)) await setMeta('lastErr', new Date().toLocaleString('de-DE') + ' · ' + (e.name || '') + ': ' + e.message);
+    if (manual) toast('Sync fehlgeschlagen – Details in den Einstellungen', 4500);
     else console.warn(e);
   } finally { S.syncing = false; syncUI(); }
 }
@@ -972,15 +1006,19 @@ async function prefetchImages() {
 /* ================= Einstellungen ================= */
 async function renderSettings() {
   const last = await getMeta('lastSync');
+  const lastErr = await getMeta('lastErr');
   const b = $('#st-body');
   const ret = Math.round((conf().retention || 0.9) * 100);
   const href = S.rt ? '' : await authUrl();
   b.innerHTML = `
+    <p class="note" style="text-align:center">Version ${APP_VERSION}</p>
     <h3>Sync iPad ↔ iPhone (Dropbox)</h3>
     ${S.rt ? `
       <p class="note">Verbunden. Die Daten liegen in deiner Dropbox unter <b>Apps › Karteikarten-HeDa</b>.</p>
       <button class="btn primary" id="st-sync">Jetzt synchronisieren</button>
       <p class="note">${last ? 'Zuletzt: ' + new Date(last).toLocaleString('de-DE') : 'Noch nicht synchronisiert.'}</p>
+      ${lastErr ? `<p class="note" style="color:var(--danger)">Letzter Fehler:</p><div class="code" id="st-err" style="font-size:13px;letter-spacing:0;text-align:left;overflow-wrap:anywhere">${esc(lastErr)}</div>
+      <button class="btn" id="st-errcopy">Fehlerdetails kopieren</button>` : ''}
       <button class="btn danger" id="st-unlink">Dropbox auf diesem Gerät trennen</button>` : `
       <p class="note">Einmal pro Gerät: bei Dropbox anmelden, „Zulassen“ tippen, den angezeigten Code kopieren und hier einfügen.</p>
       <a class="btn primary" href="${href}" target="_blank" rel="noopener">1. Bei Dropbox anmelden</a>
@@ -999,6 +1037,7 @@ async function renderSettings() {
     <p class="note">Lernalgorithmus: FSRS (ts-fsrs, MIT-Lizenz) – derselbe Algorithmus, den Anki verwendet. Daten liegen auf diesem Gerät und, wenn verbunden, in deiner Dropbox.</p>`;
   const on = (id, f) => { const el = $('#' + id); if (el) el.onclick = f; };
   on('st-sync', () => sync(true));
+  on('st-errcopy', async () => { try { await navigator.clipboard.writeText(lastErr); toast('Kopiert'); } catch { toast('Bitte Text markieren und kopieren'); } });
   on('st-unlink', async () => {
     if (!confirm('Dropbox trennen? Deine Karten bleiben auf diesem Gerät.')) return;
     S.rt = S.at = null; await setMeta('rt', null); await setMeta('rev', null); renderSettings();

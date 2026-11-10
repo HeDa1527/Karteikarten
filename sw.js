@@ -1,5 +1,5 @@
 // Offline-Cache für die App-Hülle. Version erhöhen, wenn sich Dateien ändern.
-const CACHE = "karteikasten-v4";
+const CACHE = "karteikasten-v5";
 const FILES = ["./", "index.html", "fsrs.js", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png"];
 
 self.addEventListener("install", (e) => {
@@ -19,7 +19,7 @@ self.addEventListener("fetch", (e) => {
   if (url.origin !== location.origin || e.request.method !== "GET") return;
   // Netz zuerst (damit Updates ankommen), sonst Cache
   e.respondWith(
-    fetch(e.request)
+    fetch(e.request, { cache: "no-cache" })
       .then((res) => {
         if (res.ok && url.origin === location.origin) {
           const copy = res.clone();
